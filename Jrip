@@ -1,0 +1,470 @@
+#!/usr/bin/python3
+
+"""
+Reference
+https://wiki.python.org/moin/UdpCommunication
+https://docs.python.org/3/library/time.html
+https://docs.python.org/3/library/datetime.html
+https://docs.python.org/3/howto/logging.html
+https://docs.python.org/3/library/collections.html
+https://stackoverflow.com/questions/24196932/how-can-i-get-the-ip-address-of-eth0-in-python
+
+"""
+import sys
+import socket
+import fcntl
+import struct
+import time
+import datetime
+import random
+import re
+import argparse
+import threading
+import logging
+import logging.handlers
+from collections import deque
+import json
+
+from time import gmtime, strftime
+
+buffer_size = 1 * 1024
+window_size = 5
+timeout_value = 500 # msec
+
+class TheRouter:
+    def __init__(self, loss, port, hosts):
+        self.loss = loss
+        self.myAddr = (get_ip_address('ens4'), port)
+        self.hosts = []
+        self.router = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # Make socket for UDP
+        self.router.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # socket option reuse addr
+        self.router.bind(('', port)) # Visible to outside with the interface (host, port)
+        self.hostname = socket.getfqdn()
+        self.queueTable = {}
+        self.timer = {}
+        self.seqno = {}
+        self.nextseqnum = {}
+        self.base = {}
+        self.RIPTable = [{
+        "Dest": self.myAddr[0]+":"+str(self.myAddr[1]),
+        "Next": self.myAddr[0]+":"+str(self.myAddr[1]),
+        "Cost": int(0)
+        }]
+        self.linkCost = {}
+        self.cntTimeOut = {}
+        self.ackTable = {}
+        self.traceReqBy = None
+        for host in hosts:
+            t = host.split(":")
+            ip = t[0]
+            port = t[1]
+            cost = t[2]
+            self.timer[ip +":"+port] = 0
+            self.seqno[ip +":"+port] = 0
+            self.nextseqnum[ip +":"+port] = 0
+            self.base[ip +":"+port] = 0
+            self.cntTimeOut[ip +":"+port] = 0
+            self.ackTable[ip +":"+port] = 0
+            self.hosts.append(ip +":"+port)
+            self.linkCost[ip +":"+port] = int(cost)
+        random.seed()
+
+    def main_loop(self):
+        t1 = threading.Thread(target=self.receiving)
+        t2 = threading.Thread(target=self.sending)
+        t3 = threading.Thread(target=self.flushing)
+        t1.setDaemon(True)
+        t2.setDaemon(True)
+        t3.setDaemon(True)
+        t1.start()
+        t2.start()
+        t3.start()
+
+        t = time.time()
+
+        # Step2
+        for n in range(100):
+            for host in self.hosts:
+                self.timer[host] = time.time()
+                try:
+                    if len(self.queueTable[host][0]) >= 5:
+                        fileLogger.debug("Queue is full")
+                except KeyError:
+                    fileLogger.debug("Add host in queueTable: {0}".format(host))
+                    self.queueTable[host] = [deque(maxlen=window_size), deque(maxlen=window_size)]
+                except Exception as e:
+                    fileLogger.critical(e)
+                    pass
+                finally:
+                    message = self.messageBuilder("JRIP", host, self.RIPTable)
+                    self.enqueue(host, message)
+        for num in range(len(self.hosts)):
+            streamLogger.info("Goodput Rate at {0} {1}/100".format(self.hosts[num], int(100-self.cntTimeOut[self.hosts[num]])))
+
+        streamLogger.info("Step 2 end, Start Step3,4 in 2 sec")
+        time.sleep(2)
+
+        # Step3, 4 and 5
+        while True:
+            for host in self.hosts: # ex "10.142.0.2:8000"
+                self.timer[host] = time.time()
+                try:
+                    if len(self.queueTable[host][0]) >= 5:
+                        fileLogger.debug("Queue is full")
+                except KeyError:
+                    fileLogger.debug("Add host in queueTable: {0}".format(host))
+                    self.queueTable[host] = [deque(maxlen=window_size), deque(maxlen=window_size)]
+                except Exception as e:
+                    fileLogger.critical(e)
+                    pass
+                finally:
+                    message = self.messageBuilder("JRIP", host, self.RIPTable)
+                    self.enqueue(host, message)
+                    time.sleep(10)
+                    streamLogger.info("[IP/PORT Destination]\t[DISTANCE]\t[NEXT_HOP]")
+                    for e in self.RIPTable:
+                        streamLogger.info("{0}\t\t{1}\t{2}".format(e["Dest"], e["Cost"], e["Next"]))
+                    pass
+
+        """
+        if time.time()-t > 50:
+            print("[IP/PORT Destination]\t[DISTANCE]\t[NEXT_HOP]")
+            #streamLogger.info(("[IP/PORT Destination]\t[DISTANCE]\t[NEXT_HOP]")
+            for e in self.RIPTable:
+                print("{0}\t\t{1}\t\t{2}".format(e["Dest"], e["Cost"], e["Next"]))
+                #streamLogger.info(("{0}:8000\t{1}\t{2}:8000".format(e["Dest"], e["Cost"], e["Next"]))
+            #streamLogger.info(("Goodput Rate at {0} {1}/100".format(self.hosts[0], int(100-self.cntTimeOut[self.hosts[0]])))
+            #streamLogger.info(("Goodput Rate at {0} {1}/100".format(self.hosts[1], int(100-self.cntTimeOut[self.hosts[1]])))
+            exit()
+        """
+
+    def enqueue(self, host, message):
+        self.queueTable[host][0].append(message)
+        self.queueTable[host][1].append(False)
+        self.seqno[host] += 1
+
+    # Adding new host
+    def addhost(self, host):
+        host = ":".join(host.split(":"))
+        self.timer[host] = 0
+        self.seqno[host] = 0
+        self.nextseqnum[host] = 0
+        self.base[host] = 0
+        self.cntTimeOut[host] = 0
+        self.ackTable[host] = 0
+        self.hosts.append(host)
+
+    # shifting right moving window
+    def flushing(self):
+        while True:
+            for host in self.hosts:
+                try:
+                    if self.queueTable[host][1][0] == True:
+                        self.queueTable[host][0].popleft()
+                        self.queueTable[host][1].popleft()
+                        self.base[host] += 1
+                    else:
+                        break
+                except KeyError:
+                    pass
+                except IndexError:
+                    pass
+                except Exception as e:
+                    raise
+
+    def receiving(self):
+        while True:
+            try:
+                # receving data
+                data, addr = self.router.recvfrom(buffer_size)
+                # apply drop rate
+                if random.random() >= self.loss:
+                    # Send respond ACK with empty data
+                    #print(data.decode('utf-8'))
+                    message = json.loads(data.decode('utf-8'))
+                    host = addr[0] + ":" + str(addr[1])
+                    #logger.info("Rcvd from {0:s} \t SeqNo. {1:d} \t AckNo. {2:d}".format(host, message["SEQ"], message["ACK"]))
+                    ptr = 0
+                    if message["SEQ"] is -1:
+                        #print(message["Data"])
+                        # mark the packet in the queue as ACK received
+                        ptr = message["ACK"] -1 -self.base[host]
+                        self.queueTable[host][1][ptr] = True
+
+                        # what?
+                        if message["ACK"]-1 >= self.ackTable[host]:
+                            self.ackTable[host] = message["ACK"]-1
+                    else:
+                        # Send ACK
+                        ackMessage = {"uni": "jo2522", "SEQ": -1, "ACK": message["SEQ"]+1, "Data": None}
+                        self.router.sendto(json.dumps(ackMessage).encode('utf-8'), addr)
+                        #print("Sent to {0:s} \t SeqNo. {1:d} \t AckNo. {2:d}".format(host, ackMessage["SEQ"], ackMessage["ACK"]))
+                        if message["Data"]["Type"] == "JRIP":
+                            self.updateRoutingTable(message["Data"]["RIPTable"], host)
+                        elif message["Data"]["Type"] == "TRACE":
+                            myName = self.myAddr[0] + ":" + str(self.myAddr[1])
+                            if message["Data"]["Origin"] == myName:
+                                if message["Data"]["TRACE"] is None:
+                                    # update self.traceReqBy
+                                    self.traceReqBy = addr
+                                    h = addr[0] + ":" + str(addr[1])
+                                    self.addhost(h)
+                                    fileLogger.debug("Got traceroute reqest from {0}".format(self.traceReqBy))
+                                    # Find nexthost
+                                    for e in self.RIPTable:
+                                        if e["Dest"] == message["Data"]["Destination"]:
+                                            nextHost = e["Next"].split(":")
+                                            nextHost = (nextHost[0], int(nextHost[1]))
+                                            # forward it to next hop
+                                            message = self.messageBuilder("TRACE", nextHost[0]+":"+str(nextHost[1]), message["Data"])
+                                            self.router.sendto(json.dumps(message).encode('utf-8'), nextHost)
+                                            break
+                                else:
+                                    message = self.messageBuilder("TRACE", self.traceReqBy[0]+":"+str(self.traceReqBy[1]), message["Data"])
+                                    self.router.sendto(json.dumps(message).encode('utf-8'), self.traceReqBy)
+
+                            elif message["Data"]["Destination"] == myName:
+                                ip, port = message["Data"]["Origin"].split(":")
+                                nextHost = (ip, int(port))
+                                self.addhost(nextHost[0] + ":" + str(nextHost[1]))
+                                message = self.messageBuilder("TRACE", nextHost[0]+":"+str(nextHost[1]), message["Data"])
+                                self.router.sendto(json.dumps(message).encode('utf-8'), nextHost)
+
+                            else:
+                                for e in self.RIPTable:
+                                    if e["Dest"] == message["Data"]["Destination"]:
+                                        nextHost = e["Next"].split(":")
+                                        nextHost = (nextHost[0], int(nextHost[1]))
+                                        message = self.messageBuilder("TRACE", nextHost[0]+":"+str(nextHost[1]), message["Data"])
+                                        self.router.sendto(json.dumps(message).encode('utf-8'), nextHost)
+                                        break
+                                pass
+
+                            pass
+                        else:
+                            print("Not supported Type")
+                else: # drop packet
+                    pass
+            except KeyError:
+                pass
+            except IndexError:
+                pass
+            except Exception as e:
+                raise
+
+
+    # loss rate is not applied
+    def sending(self):
+        while True:
+            time.sleep(0)
+            for host in self.hosts:
+                try:
+                    if len(self.queueTable[host][0]) > 0:
+                        #send message in the queue
+                        ip, port = host.split(":")
+                        addr = (ip, int(port))
+                        ptr = self.nextseqnum[host] -self.base[host]
+                        # Timeout Sending
+                        if time.time()*1000 - self.timer[host]*1000 >= timeout_value:
+                            fileLogger.debug("Time out")
+                            self.cntTimeOut[host] += 1
+                            for message in self.queueTable[host][0]:
+                                self.router.sendto(json.dumps(message).encode('utf-8'), addr)
+                                #logger.info("Sent to {0:s} \t SeqNo. {1:d} \t AckNo. {2:d}".format(host, message["SEQ"], message["ACK"]))
+                                #print("Sent to {0:s} \t SeqNo. {1:d} \t AckNo. {2:d}".format(host, message["SEQ"], message["ACK"]))
+                            self.timer[host] = time.time()
+
+                        # Default sending
+                        else:
+                            while ptr < window_size:
+                                message = self.queueTable[host][0][ptr]
+                                self.router.sendto(json.dumps(message).encode('utf-8'), addr)
+                                self.nextseqnum[host] += 1
+                                ptr += 1
+                                self.timer[host] = time.time()
+                                #logger.info("Sent to {0:s} \t SeqNo. {1:d} \t AckNo. {2:d}".format(host, message["SEQ"], message["ACK"]))
+                                #print("Sent to {0:s} \t SeqNo. {1:d} \t AckNo. {2:d}".format(host, message["SEQ"], message["ACK"]))
+                    else:
+                        # Nothing to send, the Queue is empty
+                        pass
+                except KeyError:
+                    pass
+                except IndexError:
+                    pass
+                except Exception:
+                    raise
+
+    def messageBuilder(self, typeOfMsg, host, data):
+        message = {}
+        message["uni"] = "jo2522"
+        message["SEQ"] = self.seqno[host]
+        message["ACK"] = 0
+        message["Data"] = {}
+        if typeOfMsg == "JRIP":
+            message["Data"]["Type"] = typeOfMsg
+            message["Data"]["RIPTable"] = data
+            return message
+        elif typeOfMsg == "TRACE":
+            message["Data"]["Type"] = typeOfMsg
+            message["Data"]["Destination"] = data["Destination"]
+            message["Data"]["Origin"] = data["Origin"]
+            myName = self.myAddr[0] + ":" + str(self.myAddr[1])
+
+            if data["Origin"] == myName:
+                # make message to return result to traceroute requester
+                if host == self.traceReqBy[0]+":"+str(self.traceReqBy[1]):
+                    message["Data"]["TRACE"] = data["TRACE"]
+                    fileLogger.debug("Return traceroute result to the requester")
+                # make message for first record for the Origin
+                else:
+                    message["Data"]["TRACE"] = [self.myAddr[0] + ":" + str(self.myAddr[1])]
+                    fileLogger.debug("Record Origin in TRACE")
+            else:
+                # make message for enroute
+                data["TRACE"].append(self.myAddr[0] + ":" + str(self.myAddr[1]))
+                message["Data"]["TRACE"] = data["TRACE"]
+                fileLogger.debug("Record enroute in TRACE")
+            return message
+        # Unsupported type of message
+        else:
+            logger.critical("Unsupported type of message")
+            sys.exit(1)
+
+    def formatting(self, data, addr):
+        # for Step 1
+        # input example
+        # 2018-04-20 04:51:06 step1_target 35.229.42.20:8000 jo2522
+        # step1_source
+        #
+        # output example
+        # Thu Mar 29 22:46:41 UTC 2018 compute03 128.59.11.31:8080 compute01
+        # Thu Mar 29 22:47:49 UTC 2018 compute03 128.59.11.32:8080 compute02
+        r = re.compile('....-..-..\s..:..:..')
+        output = []
+        if r.match(data) is not None:
+            d = data.split(' ')
+            t = time.strptime(d[0]+d[1], "%Y-%m-%d%H:%M:%S")
+            output.append(time.strftime('%a %b %d %H:%m:%S UTC %Y', t))
+            output.append(d[4])
+            output.append(addr[0] + ":" + str(addr[1]))
+            output.append(d[2])
+            output = ' '.join(output)
+            return output
+        else:
+            output.append(strftime("%a %b %d %H:%M:%S UTC %Y", gmtime()))
+            output.append(self.hostname)
+            output.append(addr[0] + ":" + str(addr[1]))
+            output.append(data)
+            output = " ".join(output)
+            return output
+
+    def formatting3(self, data, addr):
+        # for Step 3
+        # output example
+        # Thu Mar 29 22:46:41 UTC 2018 192.168.1.51:5001 7
+        output = []
+        d = data.split(" ")
+        output.append(time.strftime('%a %b %d %H:%m:%S UTC %Y', time.gmtime()))
+        output.append(d[1])
+        output.append(d[2])
+        output = ' '.join(output)
+        return output
+
+    def updateRoutingTable(self, table, host):
+        for e in table:
+            flag = False
+            for v in self.RIPTable:
+                # Existing Dest.
+                if v["Dest"] == e["Dest"]:
+                    # Compare cost
+                    flag = True
+                    if v["Cost"] > int(e["Cost"]) + self.linkCost[host]:
+                        # Update table
+                        v["Cost"] = int(e["Cost"]) + self.linkCost[host]
+                        v["Next"] = host
+                        msg = []
+                        msg.append(str(time.time()))
+                        msg.append(str(v["Dest"]))
+                        msg.append(str(v["Cost"]))
+                        msg = " ".join(msg)
+                        fileLogger.info(self.formatting3(msg, v["Dest"]))
+                        fileLogger.debug("Update in RIPTable")
+                        for h in self.RIPTable:
+                            fileLogger.debug(h)
+                        # send update
+                        for neighbor in self.hosts:
+                            message = self.messageBuilder("JRIP", neighbor, self.RIPTable)
+                            self.enqueue(neighbor, message)
+
+                        break
+            # If Dest. does not exist in Routing Table, Create
+            if flag is False:
+                vertex = {}
+                vertex["Dest"] = e["Dest"]
+                vertex["Next"] = host
+                vertex["Cost"] = int(e["Cost"]) + self.linkCost[host]
+                self.RIPTable.append(vertex)
+                msg = []
+                msg.append(str(time.time()))
+                msg.append(vertex["Dest"])
+                msg.append(str(vertex["Cost"]))
+                msg = " ".join(msg)
+                fileLogger.info(self.formatting3(msg, vertex["Dest"]))
+                fileLogger.debug("New entry in RIPTable")
+                for h in self.RIPTable:
+                    fileLogger.debug(h)
+                # send update
+                for neighbor in self.hosts:
+                    message = self.messageBuilder("JRIP", neighbor, self.RIPTable)
+                    self.enqueue(neighbor, message)
+
+
+def get_ip_address(ifname):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.inet_ntoa(fcntl.ioctl(
+        s.fileno(),
+        0x8915,  # SIOCGIFADDR
+        struct.pack('256s', bytes(ifname[:15], 'utf-8'))
+    )[20:24])
+
+def main():
+    router = TheRouter(float(args.loss), int(args.port), args.hosts)
+    try:
+        router.main_loop()
+        while(True):
+            pass
+    except KeyboardInterrupt:
+        print ("\nCtrl C - Stopping Router")
+        sys.exit(0)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Launch a proxy.')
+    parser.add_argument('hosts', nargs="+", help='List of hostsListening port')
+    parser.add_argument('-l', '--loss', type=float, default=0.0, help='Loss Possibility')
+    parser.add_argument('-p', '--port', type=int, default=8000, help='Source Port Number')
+    parser.add_argument('-q', '--quiet', action='store_true', default=False, help='only print errors')
+    parser.add_argument('-v', '--verbose', action='store_true', default=False, help='print debug info. --quiet wins if both are present')
+    args = parser.parse_args()
+
+    # set up logging
+    fileLogger = logging.getLogger("myFileLogger")
+    streamLogger = logging.getLogger("myStreamLogger")
+    fileHandler = logging.FileHandler('./step3.log', mode='w')
+    streamHandler = logging.StreamHandler()
+
+    if args.quiet:
+        level = logging.WARNING
+    elif args.verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    format = logging.Formatter("%(message)s")
+    fileHandler.setFormatter(format)
+    streamHandler.setFormatter(format)
+    fileLogger.addHandler(fileHandler)
+    streamLogger.addHandler(streamHandler)
+    fileLogger.setLevel(level)
+    streamLogger.setLevel(level)
+
+    main()
